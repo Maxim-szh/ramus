@@ -13,6 +13,8 @@ public class LocalLlmClientTest {
             String request = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
             assertTrue(request.contains("llama3.2"));
             assertTrue(request.contains("перевозка"));
+            assertTrue(request.contains("A-0"));
+            assertTrue(request.contains("декомпозиция второго уровня"));
             byte[] response = ("{\"choices\": [{\"message\": {\"content\": \""
                     + DeepSeekClient.esc("{\"operations\":[{\"tool\":\"create_element\",\"qualifier\":\"Работы\",\"name\":\"Доставка\"}]}")
                     + "\"}}]}").getBytes(StandardCharsets.UTF_8);

@@ -40,11 +40,9 @@ public final class RamusToolExecutor {
     }
 
     public List<Element> execute(Engine engine, AccessRules rules, AiPlan plan, Consumer<String> progress) {
+        new Lab1PlanValidator().validate(plan);
         List<Element> created = new ArrayList<>();
-        java.util.Map<String, Row> functions = new java.util.HashMap<>();
-        Qualifier functionQualifier = engine.getQualifierByName("Работы");
-        if (functionQualifier == null)
-            throw new IllegalStateException("В проекте нет IDEF0-классификатора «Работы».");
+        Qualifier functionQualifier = selectQualifier(engine, rules, plan);
         if (!IDEF0Plugin.isFunction(functionQualifier))
             IDEF0Plugin.installFunctionAttributes(functionQualifier, engine);
         Attribute functionName = StandardAttributesPlugin.getAttributeNameAttribute(engine);
@@ -52,6 +50,13 @@ public final class RamusToolExecutor {
                 .anyMatch(attribute -> attribute.getId() == functionName.getId());
         if (!hasNameAttribute) functionQualifier.getAttributes().add(functionName);
         functionQualifier.setAttributeForName(functionName.getId());
+        Attribute description = engine.getAttributeByName("Описание AI");
+        if (description == null) {
+            description = engine.createAttribute(new com.ramussoft.common.AttributeType("Core", "Text", true));
+            description.setName("Описание AI");
+            engine.updateAttribute(description);
+        }
+        if (!functionQualifier.getAttributes().contains(description)) functionQualifier.getAttributes().add(description);
         engine.updateQualifier(functionQualifier);
         // A contextual DataPlugin is essential: the raw NDataPlugin has no
         // base function and cannot own visible IDEF0 boxes or sectors.
@@ -63,7 +68,15 @@ public final class RamusToolExecutor {
         Function diagram = (Function) data.getBaseFunction();
         if (diagram == null)
             throw new IllegalStateException("Не удалось получить корневую функцию IDEF0-модели.");
-        diagram.setName("Модель транспортной компании");
+        String contextName = plan.operations().stream().filter(op -> "create_element".equals(op.tool())
+                && "Работы".equals(op.qualifier())).findFirst().orElseThrow().name();
+        diagram.setName(contextName);
+        diagram.setDecompositionType(0);
+        com.dsoft.pb.idef.elements.ProjectOptions options = diagram.getProjectOptions();
+        options.setProjectName(contextName);
+        options.setUsedAt("Учебная лабораторная работа №1");
+        options.setDefinition(plan.summary());
+        diagram.setProjectOptions(options);
         java.util.Map<String, Row> functionsByPath = new java.util.LinkedHashMap<>();
         java.util.Map<String, java.util.Map<String, Row>> functionsByDiagram = new java.util.LinkedHashMap<>();
         progress.accept("Шаг 1/4 — создаю контекстную диаграмму A-0");
@@ -81,6 +94,7 @@ public final class RamusToolExecutor {
             }
             if (!(row instanceof Function)) throw new IllegalStateException("Не найден контекстный блок: " + operation.name());
             layout((Function) row, 0);
+            engine.setAttribute(row.getElement(), description, operation.description());
             functionsByPath.put(operation.name(), row);
             functionsByDiagram.computeIfAbsent("", key -> new java.util.LinkedHashMap<>()).put(operation.name(), row);
         }
@@ -88,7 +102,9 @@ public final class RamusToolExecutor {
         // contain the user's own work. Rebuild in a fresh project if needed.
         progress.accept("Шаг 2/4 — размещаю работы на диаграммах");
         // Parent paths use the exact visible hierarchy, e.g. Context::A2.
-        for (AiPlan.AiOperation operation : plan.operations()) {
+        List<AiPlan.AiOperation> orderedFunctions = new ArrayList<>(plan.operations());
+        orderedFunctions.sort(java.util.Comparator.comparingInt(op -> op.qualifier().split("::").length));
+        for (AiPlan.AiOperation operation : orderedFunctions) {
             if (!"create_element".equals(operation.tool()) || !operation.qualifier().startsWith("Работы::")) continue;
             String parentPath = operation.qualifier().substring("Работы::".length());
             Row parent = functionsByPath.get(parentPath);
@@ -105,6 +121,7 @@ public final class RamusToolExecutor {
             String path = parentPath + "::" + operation.name();
             functionsByPath.put(path, row);
             local.put(operation.name(), row);
+            engine.setAttribute(row.getElement(), description, operation.description());
         }
         // Reflow each complete level only after all of its siblings exist.
         // This keeps the same plan readable when the number of blocks changes.
@@ -135,7 +152,9 @@ public final class RamusToolExecutor {
             streamsByParent.computeIfAbsent(parentPath, key -> new ArrayList<>()).add(operation);
         }
         progress.accept("Шаг 3/4 — прокладываю стрелки по уровням диаграммы");
-        for (java.util.Map.Entry<String, java.util.List<AiPlan.AiOperation>> entry : streamsByParent.entrySet()) {
+        List<java.util.Map.Entry<String, java.util.List<AiPlan.AiOperation>>> orderedLevels = new ArrayList<>(streamsByParent.entrySet());
+        orderedLevels.sort(java.util.Comparator.comparingInt(e -> e.getKey().isEmpty() ? 0 : e.getKey().split("::").length));
+        for (java.util.Map.Entry<String, java.util.List<AiPlan.AiOperation>> entry : orderedLevels) {
             String parentPath = entry.getKey();
             Function activeDiagram = parentPath.isEmpty() ? diagram : (Function) functionsByPath.get(parentPath);
             java.util.Map<String, Row> localFunctions = functionsByDiagram.get(parentPath);
@@ -145,7 +164,11 @@ public final class RamusToolExecutor {
             // Replace only sectors actually belonging to this diagram, never
             // all same-named streams elsewhere in the project.
             java.util.Set<String> namesToReplace = new java.util.HashSet<>();
-            for (AiPlan.AiOperation operation : entry.getValue()) namesToReplace.add(operation.name());
+            for (AiPlan.AiOperation operation : entry.getValue()) {
+                namesToReplace.add(operation.name());
+                // Native inherited stubs still carry the enclosing interface's name.
+                if (!operation.parentStream().isBlank()) namesToReplace.add(operation.parentStream());
+            }
             List<Sector> sectorsToReplace = new ArrayList<>();
             for (int i = 0; i < area.getRefactor().getSectorsCount(); i++) {
                 Sector existing = area.getRefactor().getSector(i).getSector();
@@ -173,20 +196,21 @@ public final class RamusToolExecutor {
                     stream.setName(operation.name());
                     created.add(stream.getElement());
                 }
+                if (!operation.description().isBlank()) engine.setAttribute(stream.getElement(), description, operation.description());
                 if (operation.source().startsWith("@")) {
                     Row target = resolveFunction(localFunctions, operation.target());
                     if (!(target instanceof Function)) throw new IllegalArgumentException("Не найдена работа-получатель стрелки: " + operation.target());
                     int side = boundarySide(operation.source());
                     createBoundaryArrow(area, (Function) target, stream, true, side,
                             nextPort(portUse, (Function) target, side), routeIndex++, labelBounds, blockBounds, labeledStreams,
-                            operation.style(), operation.color());
+                            operation.style(), operation.color(), operation.tunnel(), operation.parentStream());
                 } else if (operation.target().startsWith("@")) {
                     Row source = resolveFunction(localFunctions, operation.source());
                     if (!(source instanceof Function)) throw new IllegalArgumentException("Не найдена работа-источник стрелки: " + operation.source());
                     int side = boundarySide(operation.target());
                     createBoundaryArrow(area, (Function) source, stream, false, side,
                             nextPort(portUse, (Function) source, side), routeIndex++, labelBounds, blockBounds, labeledStreams,
-                            operation.style(), operation.color());
+                            operation.style(), operation.color(), operation.tunnel(), operation.parentStream());
                 } else {
                     Row source = resolveFunction(localFunctions, operation.source()), target = resolveFunction(localFunctions, operation.target());
                     if (!(source instanceof Function) || !(target instanceof Function)) throw new IllegalArgumentException("Стрелка ссылается на неизвестную работу: " + operation.source() + " -> " + operation.target());
@@ -235,6 +259,12 @@ public final class RamusToolExecutor {
                         + persisted.getRefactor().getSectorsCount());
         }
         progress.accept("Шаг 4/4 — проверяю названия и сохраняю результат");
+        // Cross-level branching can recreate native text while the next level
+        // is being connected. Finalize text only after the entire graph exists.
+        for (var level : orderedLevels) {
+            Function active = level.getKey().isEmpty() ? diagram : (Function) functionsByPath.get(level.getKey());
+            finalizeLabels(new MovingArea(data, active));
+        }
         // Do not report a successful run if the model API silently failed to
         // persist the labels or the drawable IDEF0 geometry.
         for (AiPlan.AiOperation operation : plan.operations()) {
@@ -259,79 +289,95 @@ public final class RamusToolExecutor {
         return null;
     }
 
-    /** Remove only the exact child blocks/arrows created by the previous AI draft,
-     * so regenerating the corrected lab structure does not leave duplicate diagrams. */
-    private static void cleanupPreviousTransportDetails(DataPlugin data, Function baseDiagram) {
-        java.util.Set<String> oldFunctions = java.util.Set.of(
-                "Заключить договор с клиентом", "Подготовить груз, предоставить транспорт и организовать логистику", "Доставить груз по адресу в срок",
-                "Уточнить характеристики груза, количество, адрес и срок", "Согласовать тариф и условия перевозки",
-                "Зафиксировать заказ охраны или сопровождения экспедитора", "Оформить договор и транспортные документы",
-                "Принять груз клиента и сверить его с договором", "Подготовить и упаковать груз при необходимости",
-                "Организовать хранение до согласованной отгрузки при необходимости", "Рассчитать маршрут и график перевозки",
-                "Подобрать транспорт и подтвердить техническую готовность", "Погрузить груз и оформить отправку",
-                "Выпустить груз на маршрут и начать перевозку", "Контролировать местоположение и соблюдение срока доставки",
-                "Обеспечить охрану и сопровождение, если заказаны", "Доставить и разгрузить груз по указанному адресу",
-                "Получить подтверждение доставки и закрыть документы",
-                "Принять груз клиента и проверить договорные данные", "Оформить документы и согласовать тарифы",
-                "Подготовить груз к перевозке", "Хранить груз при необходимости",
-                "Спланировать логистику и маршрут", "Обеспечить техническую готовность транспорта",
-                "Организовать охрану и сопровождение экспедитора",
-                "Контролировать перемещение и срок доставки",
-                "Принять груз клиента и сверить с договором",
-                "Подготовить груз и организовать хранение при необходимости",
-                "Спланировать логистику и предоставить исправный транспорт");
-        java.util.Set<String> oldStreams = java.util.Set.of(
-                "Заявка клиента и передаваемый груз", "Правила перевозки, тарифные условия и срок",
-                "Персонал, транспорт, склад и погрузочная техника", "Параметры груза и доставки",
-                "Согласованный тариф и выбранные условия", "Условия договора и заказ дополнительных услуг",
-                "Запрос клиента и сведения о грузе", "Правила перевозки и тарифные ограничения",
-                "Менеджер и система оформления документов", "Подписанный договор и согласованные услуги",
-                "Принятый и проверенный груз", "Подготовленный груз к размещению", "Груз, готовый к отгрузке",
-                "Маршрут, ограничения и временной график", "Исправное подходящее транспортное средство",
-                "Договор и груз, переданный клиентом", "Срок доставки и условия сохранности груза",
-                "Водители, логисты, склад и транспортный парк", "Подготовленный и погруженный груз, маршрут и документы",
-                "Груз и документы, выпущенные на маршрут", "Местоположение и соблюдение срока доставки",
-                "Охрана и экспедиторское сопровождение", "Доставленный и разгруженный груз",
-                "Подготовленный груз, маршрут и отправочные документы", "Адрес, срок, требования к сохранности и договор",
-                "Водитель, исправное транспортное средство, экспедитор и охрана",
-                "Принятый клиентом груз и закрывающие документы",
-                "Договорные данные для оформления", "Оформленные документы и согласованные тарифы",
-                "Данные клиента и принятый груз", "Подготовленный груз", "Груз, подготовленный к отправке",
-                "Маршрут и график перевозки", "Исправный транспорт", "Транспорт для выполнения перевозки",
-                "Загруженный груз", "Условие охраны и сопровождения по договору",
-                "Охрана и сопровождение груза", "Сведения о ходе доставки",
-                "Отклонения маршрута и корректирующие действия",
-                "Договор, параметры груза, адрес и срок", "Груз, переданный клиентом",
-                "План перевозки и подготовленный груз", "Условия доставки, охраны и сопровождения",
-                "Подтверждение доставки и закрывающие документы", "Сведения о движении груза и отклонениях",
-                "Правила перевозки, тарифы и сроки", "Транспорт, персонал, склад и средства погрузки",
-                "Принятый груз и сведения договора", "Подготовленный груз к погрузке",
-                "Маршрут, график и подходящее транспортное средство",
-                "Исправный транспорт для выполнения перевозки",
-                "Договор, характеристики груза и пункт доставки",
-                "Правила перевозки, тарифы и требования к сохранности",
-                "Транспортный парк, водитель, склад и погрузочная техника",
-                "Груз и план перевозки, готовые к исполнению договора");
-        for (Sector sector : data.getAllSectors())
-            if (sector.getStream() != null && oldStreams.contains(sector.getStream().getName())) sector.remove();
-        for (int i = baseDiagram.getChildCount() - 1; i >= 0; i--) {
-            Row child = (Row) baseDiagram.getChildAt(i);
-            if (child instanceof Function && oldFunctions.contains(child.getName())) ((AbstractRow) child).remove();
+    private static void finalizeLabels(MovingArea area) {
+        area.setActiveFunction(area.getActiveFunction());
+        List<FRectangle> blocks = new ArrayList<>(), lines = new ArrayList<>(), occupied = new ArrayList<>();
+        Function active = area.getActiveFunction();
+        for (int i = 0; i < active.getChildCount(); i++) blocks.add(((Function) active.getChildAt(i)).getBounds());
+        List<PaintSector> arrows = new ArrayList<>();
+        for (int i = 0; i < area.getRefactor().getSectorsCount(); i++) {
+            PaintSector arrow = area.getRefactor().getSector(i);
+            arrow.setText(null);
+            arrow.setShowTilda(false);
+            arrow.setShowText(false);
+            arrows.add(arrow);
+            Point[] points = arrow.getPoints();
+            for (int j = 1; j < points.length; j++) lines.add(new FRectangle(
+                    Math.min(points[j - 1].getX(), points[j].getX()), Math.min(points[j - 1].getY(), points[j].getY()),
+                    Math.max(0.1, Math.abs(points[j].getX() - points[j - 1].getX())),
+                    Math.max(0.1, Math.abs(points[j].getY() - points[j - 1].getY()))));
         }
-        for (String parentName : List.of("Заключить договор с клиентом",
-                "Подготовить груз, предоставить транспорт и организовать логистику",
-                "Доставить груз по адресу в срок")) {
-            Row oldParent = findChildByName(data, baseDiagram, parentName);
-            if (!(oldParent instanceof Function)) continue;
-            Function function = (Function) oldParent;
-            for (int i = function.getChildCount() - 1; i >= 0; i--) {
-                Row child = (Row) function.getChildAt(i);
-                if (child instanceof Function && oldFunctions.contains(child.getName())) ((AbstractRow) child).remove();
+        arrows.sort((a, b) -> Integer.compare(b.getStream().getName().length(), a.getStream().getName().length()));
+        java.util.Set<String> printed = new java.util.HashSet<>();
+        for (PaintSector arrow : arrows) {
+            if (printed.contains(arrow.getStream().getName())) continue;
+            arrow.setShowText(true);
+            arrow.setText(new com.ramussoft.pb.idef.visual.MovingLabel(area));
+            arrow.getText().setSector(arrow);
+            positionLabel(arrow, occupied, blocks, lines, printed, arrow.getStream().getName());
+        }
+        area.getRefactor().saveToFunction();
+    }
+
+    public static Qualifier functionQualifier(Engine engine) {
+        Object last = engine.getPluginProperty("RamusAI", "LastQualifier");
+        if (last instanceof Long && engine.getQualifier((Long) last) != null) return engine.getQualifier((Long) last);
+        Qualifier named = engine.getQualifierByName("Работы");
+        if (named != null && IDEF0Plugin.isFunction(named)) return named;
+        for (Qualifier qualifier : engine.getQualifiers()) if (IDEF0Plugin.isFunction(qualifier)) return qualifier;
+        return null;
+    }
+
+    private static Qualifier selectQualifier(Engine engine, AccessRules rules, AiPlan plan) {
+        // Reuse only a compatible hierarchy. Earlier flat drafts and user models
+        // stay intact in their original classifier, outside the generated A-0.
+        Qualifier selected = functionQualifier(engine);
+        if (selected != null && compatible(NDataPluginFactory.getDataPlugin(selected, engine, rules), plan)) {
+            engine.setPluginProperty("RamusAI", "LastQualifier", selected.getId());
+            return selected;
+        }
+        String root = plan.operations().stream().filter(op -> "create_element".equals(op.tool())
+                && "Работы".equals(op.qualifier())).findFirst().orElseThrow().name();
+        String prefix = "Лаб 1 — " + root;
+        for (int index = 1; ; index++) {
+            String name = index == 1 ? prefix : prefix + " (" + index + ")";
+            Qualifier existing = engine.getQualifierByName(name);
+            if (existing != null) {
+                if (IDEF0Plugin.isFunction(existing) && compatible(NDataPluginFactory.getDataPlugin(existing, engine, rules), plan)) {
+                    engine.setPluginProperty("RamusAI", "LastQualifier", existing.getId());
+                    return existing;
+                }
+                continue;
             }
-            ((AbstractRow) oldParent).remove();
+            Qualifier created = engine.createQualifier();
+            created.setName(name);
+            engine.updateQualifier(created);
+            IDEF0Plugin.installFunctionAttributes(created, engine);
+            engine.setPluginProperty("RamusAI", "LastQualifier", created.getId());
+            return created;
         }
-        for (Object value : data.getChilds(data.getBaseStream(), true))
-            if (value instanceof Stream && oldStreams.contains(((Stream) value).getName())) ((AbstractRow) value).remove();
+    }
+
+    private static boolean compatible(DataPlugin data, AiPlan plan) {
+        java.util.Map<String, java.util.Set<String>> expected = new java.util.HashMap<>();
+        java.util.Map<String, java.util.Set<String>> streams = new java.util.HashMap<>();
+        for (AiPlan.AiOperation op : plan.operations()) if ("create_element".equals(op.tool()))
+            expected.computeIfAbsent(Lab1PlanValidator.scope(op.qualifier(), "Работы"), key -> new java.util.HashSet<>()).add(op.name());
+        else streams.computeIfAbsent(Lab1PlanValidator.scope(op.qualifier(), "Потоки"), key -> new java.util.HashSet<>()).add(op.name());
+        return compatibleChildren((Function) data.getBaseFunction(), "", expected, streams);
+    }
+
+    private static boolean compatibleChildren(Function parent, String path, java.util.Map<String, java.util.Set<String>> expected,
+            java.util.Map<String, java.util.Set<String>> streams) {
+        if (expected.containsKey(path)) for (Sector existing : parent.getSectors())
+            if (existing.getStream() == null || !streams.getOrDefault(path, java.util.Set.of()).contains(existing.getStream().getName())) return false;
+        for (int i = 0; i < parent.getChildCount(); i++) {
+            Row child = (Row) parent.getChildAt(i);
+            if (!expected.getOrDefault(path, java.util.Set.of()).contains(child.getName())) return false;
+            String childPath = path.isEmpty() ? child.getName() : path + "::" + child.getName();
+            if (child instanceof Function && !compatibleChildren((Function) child, childPath, expected, streams)) return false;
+        }
+        return true;
     }
 
     private static Stream findStream(DataPlugin data, String name) {
@@ -376,7 +422,7 @@ public final class RamusToolExecutor {
     private static void createBoundaryArrow(MovingArea area, Function function, Stream stream, boolean incoming,
                                             int side, int port, int routeIndex, List<FRectangle> labelPositions,
                                             List<FRectangle> blockBounds, java.util.Set<String> labeledStreams,
-                                            String style, String color) {
+                                            String style, String color, String tunnel, String parentStream) {
         FRectangle bounds = function.getBounds();
         double centerX = clamp(bounds.getLeft() + bounds.getWidth() / 2 + portOffset(port), bounds.getLeft() + 20, bounds.getRight() - 20);
         double centerY = clamp(bounds.getTop() + bounds.getHeight() / 2 + portOffset(port), bounds.getTop() + 15, bounds.getBottom() - 15);
@@ -398,10 +444,52 @@ public final class RamusToolExecutor {
             case com.ramussoft.pb.idef.visual.MovingPanel.BOTTOM -> "mechanism";
             default -> "output";
         };
+        SectorRefactor.PerspectivePoint boundary = boundaryPoint(borderX, borderY, side,
+                incoming ? SectorRefactor.TYPE_START : SectorRefactor.TYPE_END);
+        Function active = (Function) function.getParentRow();
+        if (tunnel.isEmpty()) {
+            String inheritedName = parentStream.isBlank() ? stream.getName() : parentStream;
+            boundary.crosspoint = inheritedCrosspoint(area.getDataPlugin(), active, inheritedName, side, incoming);
+            if (!parentStream.isBlank() && boundary.crosspoint == null)
+                throw new IllegalStateException("Не найден родительский поток ветви «" + stream.getName() + "»: " + parentStream);
+        }
+        // All branches of one interface enter/leave at the same boundary point.
+        // This keeps the inherited resource/control interface visually joined.
+        for (int i = 0; i < area.getRefactor().getSectorsCount(); i++) {
+            PaintSector peer = area.getRefactor().getSector(i);
+            if (peer.getStream() == null || !stream.getName().equals(peer.getStream().getName())) continue;
+            var peerBorder = incoming ? peer.getSector().getStart() : peer.getSector().getEnd();
+            if (peerBorder.getBorderType() != side) continue;
+            Point peerPoint = incoming ? peer.getStartPoint() : peer.getEndPoint();
+            boundary.x = peerPoint.getX(); boundary.y = peerPoint.getY();
+            boundary.crosspoint = peerBorder.getCrosspoint();
+            break;
+        }
         createArrow(area,
-                incoming ? boundaryPoint(borderX, borderY, side, SectorRefactor.TYPE_START) : functionPoint,
-                incoming ? functionPoint : boundaryPoint(borderX, borderY, side, SectorRefactor.TYPE_END),
+                incoming ? boundary : functionPoint,
+                incoming ? functionPoint : boundary,
                 new Row[]{function}, stream, routeIndex, boundaryIcom, labelPositions, blockBounds, labeledStreams, style, color);
+        PaintSector created = area.getRefactor().getSector(area.getRefactor().getSectorsCount() - 1);
+        if ("soft".equals(tunnel)) {
+            com.ramussoft.pb.data.negine.NSectorBorder border = incoming ? created.getSector().getStart() : created.getSector().getEnd();
+            border.setTunnelSoft(com.ramussoft.pb.Crosspoint.TUNNEL_SOFT);
+        }
+    }
+
+    private static com.ramussoft.pb.Crosspoint inheritedCrosspoint(DataPlugin data, Function active,
+            String stream, int side, boolean incoming) {
+        com.ramussoft.pb.Crosspoint shared = null;
+        for (Sector candidate : data.getAllSectors()) {
+            if (candidate.getStream() == null || !stream.equals(candidate.getStream().getName())) continue;
+            com.ramussoft.pb.data.negine.NSectorBorder endpoint = incoming ? candidate.getEnd() : candidate.getStart();
+            if (!active.equals(endpoint.getFunction()) || endpoint.getFunctionType() != side) continue;
+            if (shared == null) shared = endpoint.getCrosspoint();
+            else if (shared.getGlobalId() != endpoint.getCrosspoint().getGlobalId()) {
+                endpoint.setCrosspointA(shared);
+                endpoint.commit();
+            }
+        }
+        return shared;
     }
 
     private static void createArrow(MovingArea area, SectorRefactor.PerspectivePoint start,
@@ -419,7 +507,21 @@ public final class RamusToolExecutor {
         if (refactor.getSectorsCount() != previousSectorCount + 1)
             throw new IllegalStateException("Ramus не создал геометрию стрелки: " + stream.getName());
         PaintSector paintSector = refactor.getSector(refactor.getSectorsCount() - 1);
-        paintSector.setStream(stream, com.ramussoft.pb.idef.elements.ReplaceStreamType.SIMPLE);
+        preserveBoundaryPosition(paintSector.getStartPoint(), start);
+        preserveBoundaryPosition(paintSector.getEndPoint(), end);
+        // Each planned sector has its own explicit stream. Ramus' SIMPLE
+        // replacement propagates across crosspoints and can overwrite the
+        // parent or a sibling's renamed branch. Keep the native crosspoint,
+        // but assign this sector only; every level is populated by the plan.
+        ((com.ramussoft.pb.data.AbstractSector) paintSector.getSector()).setThisStream(stream);
+        // createMiss also creates empty native stubs on the child's diagram.
+        // Initialize those, without replacing already named parent/sibling sectors.
+        for (var crosspoint : new com.ramussoft.pb.Crosspoint[]{paintSector.getStart(), paintSector.getEnd()}) {
+            if (crosspoint == null) continue;
+            for (Sector peer : crosspoint.getOppozite(paintSector.getSector()))
+                if (peer.getStream() == null)
+                    ((com.ramussoft.pb.data.AbstractSector) peer).setThisStream(stream);
+        }
         paintSector.setShowText(true);
         paintSector.createTexts();
         paintSector.setRows(rows);
@@ -428,6 +530,18 @@ public final class RamusToolExecutor {
         paintSector.setStroke(arrowStroke(style, icom));
         routeOrthogonally(paintSector, routeIndex, labelBounds, blockBounds, labeledStreams, stream.getName());
         paintSector.saveVisual();
+    }
+
+    private static void preserveBoundaryPosition(Point point, SectorRefactor.PerspectivePoint boundary) {
+        if (boundary.function != null || boundary.borderType < 0) return;
+        // PointBuilder aligns a straight border arrow with its function port.
+        // Detach that ordinate before restoring a shared boundary origin.
+        if (boundary.borderType == com.ramussoft.pb.idef.visual.MovingPanel.TOP
+                || boundary.borderType == com.ramussoft.pb.idef.visual.MovingPanel.BOTTOM) {
+            Ordinate x = new Ordinate(Ordinate.TYPE_X); x.setPosition(boundary.x); point.setXOrdinate(x);
+        } else {
+            Ordinate y = new Ordinate(Ordinate.TYPE_Y); y.setPosition(boundary.y); point.setYOrdinate(y);
+        }
     }
 
     private static Color arrowColor(String icom, String requested) {
@@ -444,8 +558,8 @@ public final class RamusToolExecutor {
 
     private static Stroke arrowStroke(String requested, String icom) {
         String style = requested == null ? "" : requested.toLowerCase(java.util.Locale.ROOT);
-        if (!List.of("solid", "dashed", "dotted", "lightning").contains(style))
-            style = "control".equalsIgnoreCase(icom) ? "dashed" : "solid";
+        if ("feedback".equals(style)) return new BasicStroke(2.2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
+        if (!List.of("solid", "dashed", "dotted", "lightning").contains(style)) style = "solid";
         if ("lightning".equals(style)) {
             WayStroke stroke = new WayStroke(1f);
             stroke.setType(1);
@@ -474,7 +588,18 @@ public final class RamusToolExecutor {
         int endSide = endBorder.getFunction() != null ? endBorder.getFunctionType() : endBorder.getBorderType();
         java.awt.geom.Point2D.Double startStub = stub(x1, y1, startSide, startBorder.getFunction() != null);
         java.awt.geom.Point2D.Double endStub = stub(x2, y2, endSide, endBorder.getFunction() != null);
-        List<java.awt.geom.Point2D.Double> path = ArrowRouter.route(startStub, endStub, blockBounds);
+        List<FRectangle> existingLines = new ArrayList<>();
+        SectorRefactor drawing = sector.getMovingArea().getRefactor();
+        for (int i = 0; i < drawing.getSectorsCount(); i++) {
+            PaintSector other = drawing.getSector(i);
+            if (other == sector) continue;
+            Point[] line = other.getPoints();
+            for (int j = 1; j < line.length; j++) existingLines.add(new FRectangle(
+                    Math.min(line[j - 1].getX(), line[j].getX()), Math.min(line[j - 1].getY(), line[j].getY()),
+                    Math.max(0.1, Math.abs(line[j].getX() - line[j - 1].getX())),
+                    Math.max(0.1, Math.abs(line[j].getY() - line[j - 1].getY()))));
+        }
+        List<java.awt.geom.Point2D.Double> path = ArrowRouter.route(startStub, endStub, blockBounds, existingLines);
         List<Point> points = new ArrayList<>();
         points.add(start);
         for (int i = 0; i < path.size(); i++) {
@@ -518,7 +643,13 @@ public final class RamusToolExecutor {
     private static void positionLabel(PaintSector sector, List<FRectangle> occupied,
                                       List<FRectangle> blocks, List<FRectangle> lines, java.util.Set<String> labeledStreams,
                                       String streamName) {
-        if (labeledStreams.contains(streamName)) return;
+        if (labeledStreams.contains(streamName)) {
+            sector.setShowTilda(false);
+            sector.setShowText(false);
+            sector.setText(null);
+            sector.saveVisual();
+            return;
+        }
         Point[] points = sector.getPoints();
         double longest = 0, anchorX = Double.NaN, anchorY = Double.NaN;
         for (int i = 1; i < points.length; i++) {
@@ -557,6 +688,9 @@ public final class RamusToolExecutor {
             FRectangle labelRect = placeLabel(anchorX, anchorY, width, height, occupied, blocks, lines,
                     sector.getMovingArea().getDoubleWidth(), sector.getMovingArea().getDoubleHeight());
             text.setBounds(labelRect);
+            double dx = Math.max(labelRect.getLeft() - anchorX, Math.max(0, anchorX - labelRect.getRight()));
+            double dy = Math.max(labelRect.getTop() - anchorY, Math.max(0, anchorY - labelRect.getBottom()));
+            sector.setShowTilda(Math.hypot(dx, dy) > 10);
             labeledStreams.add(streamName);
             occupied.add(labelRect);
         }
@@ -660,8 +794,8 @@ public final class RamusToolExecutor {
         double gap = count <= 1 ? 0 : Math.min(96, Math.max(64, (760 - count * width) / (count - 1)));
         double rowWidth = count * width + (count - 1) * gap;
         double startX = Math.max(24, (800 - rowWidth) / 2);
-        double stagger = (index % 2 == 0 ? -18 : 18);
-        function.setBounds(new FRectangle(startX + index * (width + gap), 225 + stagger, width, height));
+        double top = count == 3 ? 110 + index * 98 : 190 + (index % 2) * 50;
+        function.setBounds(new FRectangle(startX + index * (width + gap), top, width, height));
         int ownLines = Math.max(1, (int) Math.ceil(function.getName().length() / 26.0));
         function.setFont(new Font(Font.DIALOG, Font.PLAIN, ownLines > 2 ? 8 : 9));
         function.setBackground(blockColor(function.getName()));
@@ -670,27 +804,16 @@ public final class RamusToolExecutor {
 
     private static void layoutChild(Function function, int index, int count, int longestCaption) {
         count = Math.max(1, count);
-        int columns = Math.min(4, Math.max(1, (int) Math.ceil(Math.sqrt(count))));
-        int rows = (count + columns - 1) / columns;
-        int lines = Math.max(1, (int) Math.ceil(longestCaption / 26.0));
-        double width = clamp(155 - Math.sqrt(count) * 9, 112, 145);
-        double height = clamp(42 + lines * 7, 56, 66);
-        double gapX = columns >= 4 ? 40 : 95;
-        double gapY = rows <= 1 ? 0 : clamp((320 - rows * height) / (rows - 1), 24, 64);
-        width = Math.min(width, (760 - (columns - 1) * gapX) / columns);
-        height = Math.min(height, (352 - (rows - 1) * gapY) / rows);
-        if (height < 34) throw new IllegalArgumentException("Слишком много работ для читаемого размещения на одном листе. Разделите модель на декомпозиции.");
-        double totalWidth = columns * width + (columns - 1) * gapX;
-        double totalHeight = rows * height + (rows - 1) * gapY;
-        double startX = Math.max(24, (800 - totalWidth) / 2);
-        // IDEF0's editable height is 444 at the standard page size, not 520.
-        double startY = Math.max(40, (444 - totalHeight) / 2);
-        int row = index / columns, column = index % columns;
-        if (row % 2 == 1) column = columns - 1 - column;
-        double stagger = rows > 1 ? ((column + row) % 3 - 1) * 7 : 0;
-        function.setBounds(new FRectangle(startX + column * (width + gapX), startY + row * (height + gapY) + stagger, width, height));
-        int ownLines = Math.max(1, (int) Math.ceil(function.getName().length() / 26.0));
-        function.setFont(new Font(Font.DIALOG, Font.PLAIN, ownLines > 2 ? 8 : 9));
+        // Ramus numbers siblings by X position. Keep X increasing in process
+        // order, while staggering Y to reserve space for orthogonal links.
+        double width = clamp((690 - (count - 1) * 30.0) / count, 96, 150);
+        double gap = count == 1 ? 0 : (720 - count * width) / (count - 1);
+        double x = (800 - (count * width + (count - 1) * gap)) / 2 + index * (width + gap);
+        double y = count == 1 ? 205 : 96 + index * (218.0 / (count - 1));
+        int lines = Math.max(1, (int) Math.ceil(function.getName().length() / (width / 4.1)));
+        double height = clamp(32 + lines * 10, 60, 78);
+        function.setBounds(new FRectangle(x, y, width, height));
+        function.setFont(new Font(Font.DIALOG, Font.PLAIN, width < 120 ? 8 : 9));
         function.setBackground(blockColor(function.getName()));
         function.setForeground(new Color(45, 52, 63));
     }

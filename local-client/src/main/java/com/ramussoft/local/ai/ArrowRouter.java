@@ -15,12 +15,25 @@ final class ArrowRouter {
 
     static List<Point2D.Double> route(Point2D.Double start, Point2D.Double end,
             List<FRectangle> blocks) {
+        return route(start, end, blocks, List.of());
+    }
+
+    static List<Point2D.Double> route(Point2D.Double start, Point2D.Double end,
+            List<FRectangle> blocks, List<FRectangle> existingLines) {
         TreeSet<Double> xs = new TreeSet<>(), ys = new TreeSet<>();
         xs.add(start.x); xs.add(end.x); ys.add(start.y); ys.add(end.y);
         for (FRectangle block : blocks) {
             xs.add(block.getLeft() - 5); xs.add(block.getRight() + 5);
             ys.add(block.getTop() - 5); ys.add(block.getBottom() + 5);
         }
+        // Alternative lanes let later links avoid being drawn on top of earlier ones.
+        for (FRectangle line : existingLines) {
+            xs.add(line.getLeft() - 8); xs.add(line.getRight() + 8);
+            ys.add(line.getTop() - 8); ys.add(line.getBottom() + 8);
+        }
+        xs.removeIf(v -> v < 5 || v > 795);
+        ys.removeIf(v -> v < 5 || v > 439);
+        xs.add(start.x); xs.add(end.x); ys.add(start.y); ys.add(end.y);
         List<Double> x = new ArrayList<>(xs), y = new ArrayList<>(ys);
         int width = x.size(), height = y.size(), states = width * height * 3;
         double[] distance = new double[states]; Arrays.fill(distance, Double.POSITIVE_INFINITY);
@@ -45,7 +58,8 @@ final class ArrowRouter {
                 int nextDirection = step[0] != 0 ? 1 : 2;
                 int next = (nextRow * width + nextCol) * 3 + nextDirection;
                 double cost = current.cost + Math.abs(x2 - x1) + Math.abs(y2 - y1)
-                        + (direction != 0 && direction != nextDirection ? 18 : 0);
+                        + (direction != 0 && direction != nextDirection ? 18 : 0)
+                        + congestion(x1, y1, x2, y2, existingLines);
                 if (cost < distance[next]) {
                     distance[next] = cost; previous[next] = current.state; queue.add(new Node(next, cost));
                 }
@@ -63,6 +77,22 @@ final class ArrowRouter {
             if ((a.x == b.x && b.x == c.x) || (a.y == b.y && b.y == c.y)) result.remove(i);
         }
         return result;
+    }
+
+    private static double congestion(double x1, double y1, double x2, double y2, List<FRectangle> lines) {
+        double penalty = 0;
+        for (FRectangle line : lines) {
+            boolean horizontal = line.getWidth() > line.getHeight();
+            if (y1 == y2 && horizontal && Math.abs(y1 - line.getTop()) < 3)
+                penalty += Math.max(0, Math.min(Math.max(x1, x2), line.getRight()) - Math.max(Math.min(x1, x2), line.getLeft())) * 25;
+            else if (x1 == x2 && !horizontal && Math.abs(x1 - line.getLeft()) < 3)
+                penalty += Math.max(0, Math.min(Math.max(y1, y2), line.getBottom()) - Math.max(Math.min(y1, y2), line.getTop())) * 25;
+            else if (y1 == y2 && !horizontal && line.getLeft() > Math.min(x1, x2) && line.getLeft() < Math.max(x1, x2)
+                    && y1 > line.getTop() && y1 < line.getBottom()) penalty += 60;
+            else if (x1 == x2 && horizontal && line.getTop() > Math.min(y1, y2) && line.getTop() < Math.max(y1, y2)
+                    && x1 > line.getLeft() && x1 < line.getRight()) penalty += 60;
+        }
+        return penalty;
     }
 
     static boolean crossesBlock(double x1, double y1, double x2, double y2, List<FRectangle> blocks) {

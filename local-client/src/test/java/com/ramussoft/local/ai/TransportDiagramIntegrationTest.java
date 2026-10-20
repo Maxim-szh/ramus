@@ -1,16 +1,17 @@
 package com.ramussoft.local.ai;
 
 import com.ramussoft.common.Engine;
+import com.ramussoft.common.Qualifier;
 import com.ramussoft.core.impl.FileIEngineImpl;
 import com.ramussoft.database.FileDatabaseFactory;
 import com.ramussoft.database.MemoryDatabase;
 import com.ramussoft.idef0.NDataPluginFactory;
-import com.ramussoft.pb.DataPlugin;
-import com.ramussoft.pb.Function;
+import com.ramussoft.pb.*;
 import com.ramussoft.pb.idef.elements.PaintSector;
 import com.ramussoft.pb.idef.visual.MovingArea;
+import com.dsoft.pb.types.FRectangle;
 import java.io.File;
-import java.lang.reflect.Method;
+import java.util.*;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -19,86 +20,82 @@ import static org.junit.Assert.*;
 public class TransportDiagramIntegrationTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
 
-    @Test public void savesNamedConnectedArrowsInOneDiagram() throws Exception {
+    @Test public void savesBalancedHierarchyAndReopensWithoutDuplicatingObjects() throws Exception {
         String previousHome = System.getProperty("user.home");
         System.setProperty("java.awt.headless", "true");
         System.setProperty("user.home", temporary.newFolder("home").getAbsolutePath());
         File root = new File(System.getProperty("user.dir"));
         while (root != null && !new File(root, "settings.gradle").isFile()) root = root.getParentFile();
         assertNotNull(root);
-        MemoryDatabase db = (MemoryDatabase) FileDatabaseFactory.createDatabase(new File(root, "dest/doc/en/Enterprise activity.rsf"));
+        MemoryDatabase db = (MemoryDatabase) FileDatabaseFactory.createDatabase();
         Engine engine = null;
         try {
             engine = db.getEngine(null);
-            if (engine.getQualifierByName("Работы") == null) {
-                for (com.ramussoft.common.Qualifier qualifier : engine.getQualifiers()) {
-                    if (com.ramussoft.idef0.IDEF0Plugin.isFunction(qualifier)) {
-                        qualifier.setName("Работы");
-                        engine.updateQualifier(qualifier);
-                        break;
-                    }
-                }
+            AiPlan plan = TransportCompanyPlan.create();
+            StringBuilder json = new StringBuilder("{\"operations\":[");
+            for (AiPlan.AiOperation a : plan.operations()) {
+                if (json.charAt(json.length() - 1) != '[') json.append(',');
+                json.append("{\"tool\":\"").append(DeepSeekClient.esc(a.tool()))
+                        .append("\",\"qualifier\":\"").append(DeepSeekClient.esc(a.qualifier()))
+                        .append("\",\"name\":\"").append(DeepSeekClient.esc(a.name()))
+                        .append("\",\"source\":\"").append(DeepSeekClient.esc(a.source()))
+                        .append("\",\"target\":\"").append(DeepSeekClient.esc(a.target()))
+                        .append("\",\"icom\":\"").append(a.icom())
+                        .append("\",\"description\":\"").append(DeepSeekClient.esc(a.description()))
+                        .append("\",\"tunnel\":\"").append(a.tunnel()).append("\"}");
             }
-            Method planMethod = Class.forName("com.ramussoft.local.ai.RamusAiPlugin$AssistantView")
-                    .getDeclaredMethod("transportCompanyPlan");
-            planMethod.setAccessible(true);
-            AiPlan plan = (AiPlan) planMethod.invoke(null);
+            json.append("]}");
+            java.nio.file.Files.writeString(new File(root, "local-client/build/lab1-plan.json").toPath(), json);
             new RamusToolExecutor().execute(engine, db.getAccessRules(null), plan);
-            File saved = temporary.newFile("transport.rsf");
+            long modelId = RamusToolExecutor.functionQualifier(engine).getId();
+            DataPlugin nativeData = NDataPluginFactory.getDataPlugin(RamusToolExecutor.functionQualifier(engine), engine, db.getAccessRules(null));
+            Sector temporarySector = nativeData.createSector();
+            temporarySector.setShowText(false);
+            temporarySector.setAlternativeText("Проверка свойства");
+            temporarySector.setCreateState(-1, 12.5);
+            assertFalse(temporarySector.isShowText());
+            assertEquals("Проверка свойства", temporarySector.getAlternativeText());
+            assertEquals(-1, temporarySector.getCreateState());
+            temporarySector.remove();
+            assertTrue("A second run must reuse existing functions and streams",
+                    new RamusToolExecutor().execute(engine, db.getAccessRules(null), plan).isEmpty());
+            assertEquals(modelId, RamusToolExecutor.functionQualifier(engine).getId());
+            File saved = new File(root, "local-client/build/lab1-transport.rsf");
             ((FileIEngineImpl) engine.getDeligate()).saveToFile(saved);
-            MemoryDatabase reopenedDatabase = (MemoryDatabase) FileDatabaseFactory.createDatabase(saved);
-            Engine reopenedEngine = reopenedDatabase.getEngine(null);
+            MemoryDatabase reopened = (MemoryDatabase) FileDatabaseFactory.createDatabase(saved);
+            Engine restored = reopened.getEngine(null);
             try {
-            DataPlugin data = NDataPluginFactory.getDataPlugin(reopenedEngine.getQualifierByName("Работы"), reopenedEngine, reopenedDatabase.getAccessRules(null));
-            Function rootFunction = (Function) data.getBaseFunction();
-            Function context = null;
-            for (int i = 0; i < rootFunction.getChildCount(); i++) {
-                Function candidate = (Function) rootFunction.getChildAt(i);
-                if ("Оказать услуги по перевозке грузов".equals(candidate.getName())) context = candidate;
-            }
-            assertNotNull(context);
-            assertTrue(context.getChildCount() >= 9);
-            MovingArea reopened = new MovingArea(data, context);
-            reopened.setActiveFunction(context);
-            int named = 0, connected = 0, tildas = 0;
-            java.util.List<com.dsoft.pb.types.FRectangle> labelRectangles = new java.util.ArrayList<>();
-            for (int i = 0; i < reopened.getRefactor().getSectorsCount(); i++) {
-                PaintSector arrow = reopened.getRefactor().getSector(i);
-                if (arrow.getStream() != null && arrow.getStream().getName() != null) named++;
-                if (arrow.getSector().getStart().getFunction() != null && arrow.getSector().getEnd().getFunction() != null) connected++;
-                if (arrow.isShowTilda() && arrow.getText() != null) tildas++;
-                if (arrow.getText() != null) {
-                    com.dsoft.pb.types.FRectangle label = arrow.getText().getBounds();
-                    assertTrue("Label is outside the diagram: " + arrow.getText().getText(), label.getLeft() >= 0 && label.getTop() >= 0
-                            && label.getRight() <= reopened.getDoubleWidth() && label.getBottom() <= reopened.getDoubleHeight());
-                    for (int j = 0; j < context.getChildCount(); j++) {
-                        Function block = (Function) context.getChildAt(j);
-                        assertFalse("Label overlaps a block: " + arrow.getText().getText() + " / " + block.getName(), overlaps(label, block.getBounds()));
-                    }
-                    for (com.dsoft.pb.types.FRectangle other : labelRectangles)
-                        assertFalse("Arrow labels overlap: " + arrow.getText().getText(), overlaps(label, other));
-                    for (int j = 0; j < reopened.getRefactor().getSectorsCount(); j++) {
-                        com.ramussoft.pb.idef.elements.Point[] points = reopened.getRefactor().getSector(j).getPoints();
-                        for (int k = 1; k < points.length; k++) {
-                            com.ramussoft.pb.idef.elements.Point a = points[k - 1], b = points[k];
-                            com.dsoft.pb.types.FRectangle line = new com.dsoft.pb.types.FRectangle(
-                                    Math.min(a.getX(), b.getX()), Math.min(a.getY(), b.getY()),
-                                    Math.max(0.1, Math.abs(a.getX() - b.getX())), Math.max(0.1, Math.abs(a.getY() - b.getY())));
-                            assertFalse("Arrow label crosses a line: " + arrow.getText().getText(), overlaps(label, line));
-                        }
-                    }
-                    labelRectangles.add(label);
+                Qualifier qualifier = restored.getQualifier(modelId);
+                DataPlugin data = NDataPluginFactory.getDataPlugin(qualifier, restored, reopened.getAccessRules(null));
+                Function base = (Function) data.getBaseFunction();
+                assertEquals("A-0 must contain one function", 1, base.getChildCount());
+                Function context = (Function) base.getChildAt(0);
+                assertEquals(TransportCompanyPlan.CONTEXT, context.getName());
+                assertEquals("A0 must have the three stated stages", 3, context.getChildCount());
+                checkDiagram(data, base, new File(root, "local-client/build/lab1-A-0.png"), false);
+                checkDiagram(data, context, new File(root, "local-client/build/lab1-A0.png"), true);
+                int[] childCounts = {4, 5, 4};
+                for (int i = 0; i < 3; i++) {
+                    Function stage = (Function) context.getChildAt(i);
+                    assertEquals(childCounts[i], stage.getChildCount());
+                    assertFalse("Function description must persist", ((String) restored.getAttribute(
+                            stage.getElement(), restored.getAttributeByName("Описание AI"))).isBlank());
+                    checkDiagram(data, stage, new File(root, "local-client/build/lab1-A" + (i + 1) + ".png"), true);
                 }
-            }
-            assertTrue("No named arrows after reopening", named >= 18);
-            assertTrue("No internal block connections after reopening", connected >= 12);
-            assertTrue("No labels with tildes after reopening", tildas > 0);
-            com.ramussoft.pb.print.PIDEF0painter painter = new com.ramussoft.pb.print.PIDEF0painter(
-                    context, new java.awt.Dimension(1600, 1200), data);
-            javax.imageio.ImageIO.write(painter.createImage(null), "png", new File("build/transport-test.png"));
+                Function preparation = (Function) context.getChildAt(1);
+                assertEquals("Спланировать логистику", ((Function) preparation.getChildAt(0)).getName());
+                assertEquals("Погрузить груз", ((Function) preparation.getChildAt(4)).getName());
+                assertTrue("The explicit local maintenance tunnel must persist",
+                        data.getAllSectors().stream().anyMatch(s -> s.getStream() != null && "Заявка на ТО".equals(s.getStream().getName())
+                            && s.getEnd().getTunnelSoft() == Crosspoint.TUNNEL_SOFT));
+                // A second vocabulary must not replace or rename the transport project.
+                new RamusToolExecutor().execute(engine, db.getAccessRules(null), Lab1PlanValidatorTest.libraryPlan());
+                assertTrue(modelId != RamusToolExecutor.functionQualifier(engine).getId());
+                assertEquals(1, base.getChildCount());
+                assertEquals(TransportCompanyPlan.CONTEXT, context.getName());
             } finally {
-                ((FileIEngineImpl) reopenedEngine.getDeligate()).close();
-                reopenedDatabase.close();
+                ((FileIEngineImpl) restored.getDeligate()).close();
+                reopened.close();
             }
         } finally {
             if (engine != null) ((FileIEngineImpl) engine.getDeligate()).close();
@@ -107,7 +104,61 @@ public class TransportDiagramIntegrationTest {
         }
     }
 
-    private static boolean overlaps(com.dsoft.pb.types.FRectangle a, com.dsoft.pb.types.FRectangle b) {
+    private static void checkDiagram(DataPlugin data, Function diagram, File image, boolean inherited) throws Exception {
+        MovingArea area = new MovingArea(data, diagram);
+        area.setActiveFunction(diagram);
+        List<FRectangle> labels = new ArrayList<>();
+        Set<String> printedNames = new HashSet<>();
+        int internal = 0;
+        for (int i = 0; i < area.getRefactor().getSectorsCount(); i++) {
+            PaintSector arrow = area.getRefactor().getSector(i);
+            assertNotNull("Unnamed native stub on " + diagram.getName(), arrow.getStream());
+            assertFalse(arrow.getStream().getName().isBlank());
+            var start = arrow.getSector().getStart();
+            var end = arrow.getSector().getEnd();
+            assertTrue("Arrow has a dangling source", start.getFunction() != null || start.getBorderType() >= 0);
+            assertTrue("Arrow has a dangling destination", end.getFunction() != null || end.getBorderType() >= 0);
+            var path = arrow.getPoints();
+            List<FRectangle> blocks = new ArrayList<>();
+            for (int j = 0; j < diagram.getChildCount(); j++) blocks.add(((Function) diagram.getChildAt(j)).getBounds());
+            for (int j = 1; j < path.length; j++) assertFalse("Arrow crosses a block: " + arrow.getStream().getName(),
+                    ArrowRouter.crossesBlock(path[j - 1].getX(), path[j - 1].getY(), path[j].getX(), path[j].getY(), blocks));
+            if (start.getFunction() != null && end.getFunction() != null) internal++;
+            if (inherited && start.getBorderType() >= 0) {
+                assertTrue("Boundary must be linked to a parent-level arrow: " + arrow.getStream().getName(),
+                        start.getCrosspoint().getIns().length > 0);
+            }
+            if (inherited && end.getBorderType() >= 0 && end.getTunnelSoft() != Crosspoint.TUNNEL_SOFT) {
+                assertTrue("Output must be linked to a parent-level arrow: " + arrow.getStream().getName(),
+                        end.getCrosspoint().getOuts().length > 0);
+            }
+            if (arrow.getText() != null && arrow.isShowText()) {
+                assertTrue("Duplicate label: " + arrow.getStream().getName(), printedNames.add(arrow.getStream().getName()));
+                FRectangle label = arrow.getText().getBounds();
+                assertTrue("Label outside page", label.getLeft() >= 0 && label.getTop() >= 0
+                        && label.getRight() <= area.getDoubleWidth() && label.getBottom() <= area.getDoubleHeight());
+                for (int j = 0; j < diagram.getChildCount(); j++)
+                    assertFalse("Label overlaps block: " + arrow.getStream().getName(),
+                            overlaps(label, ((Function) diagram.getChildAt(j)).getBounds()));
+                for (FRectangle other : labels) assertFalse("Labels overlap: " + arrow.getStream().getName(), overlaps(label, other));
+                for (int j = 0; j < area.getRefactor().getSectorsCount(); j++) {
+                    var line = area.getRefactor().getSector(j).getPoints();
+                    for (int k = 1; k < line.length; k++) assertFalse("Text overlaps an arrow: " + arrow.getStream().getName(),
+                            overlaps(label, new FRectangle(Math.min(line[k - 1].getX(), line[k].getX()),
+                                    Math.min(line[k - 1].getY(), line[k].getY()),
+                                    Math.max(0.1, Math.abs(line[k].getX() - line[k - 1].getX())),
+                                    Math.max(0.1, Math.abs(line[k].getY() - line[k - 1].getY())))));
+                }
+                labels.add(label);
+            }
+        }
+        if (diagram.getChildCount() > 1) assertTrue("No internal arrows", internal > 0);
+        com.ramussoft.pb.print.PIDEF0painter painter = new com.ramussoft.pb.print.PIDEF0painter(
+                diagram, new java.awt.Dimension(2000, 1400), data);
+        javax.imageio.ImageIO.write(painter.createImage(null), "png", image);
+    }
+
+    private static boolean overlaps(FRectangle a, FRectangle b) {
         return a.getLeft() < b.getRight() && a.getRight() > b.getLeft()
                 && a.getTop() < b.getBottom() && a.getBottom() > b.getTop();
     }

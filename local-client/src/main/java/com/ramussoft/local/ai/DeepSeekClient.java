@@ -8,8 +8,10 @@ import java.time.Duration;
 public final class DeepSeekClient {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(8)).build();
     public String analyze(String prompt, ModelSnapshot snapshot, String apiKey, String model) throws Exception {
+        return complete("You analyze Ramus IDEF0/DFD model snapshots. Return concise findings only. Do not invent IDs or apply changes.", prompt, snapshot, apiKey, model);
+    }
+    private String complete(String system, String prompt, ModelSnapshot snapshot, String apiKey, String model) throws Exception {
         if (apiKey == null || apiKey.isBlank()) throw new IllegalArgumentException("DeepSeek API key is empty");
-        String system = "You analyze Ramus IDEF0/DFD model snapshots. Return concise findings only. Do not invent IDs or apply changes.";
         String user = prompt + "\n\nSnapshot:\n" + snapshot.content();
         String body = "{\"model\":\"" + esc(model) + "\",\"messages\":[{\"role\":\"system\",\"content\":\"" + esc(system)
                 + "\"},{\"role\":\"user\",\"content\":\"" + esc(user) + "\"}],\"stream\":false}";
@@ -21,8 +23,7 @@ public final class DeepSeekClient {
         return content(response.body());
     }
     public String generatePlan(String prompt, ModelSnapshot snapshot, String apiKey, String model) throws Exception {
-        String system = "Return JSON only, without markdown. Schema: {\"operations\":[{\"tool\":\"create_element\",\"qualifier\":\"Работы\",\"name\":\"...\"},{\"tool\":\"create_stream\",\"qualifier\":\"Потоки\",\"name\":\"...\",\"source\":\"exact function name\",\"target\":\"exact function name\",\"icom\":\"input|control|mechanism|output\",\"style\":\"solid|dashed|dotted|lightning\",\"color\":\"#RRGGBB\"}]}. Use only these two tools. Create hierarchies in readable levels. Route feedback around blocks, not through them. Choose styles sparingly: control dashed, normal flow solid; use lightning only when the user asks for it. Return a color only as #RRGGBB. Create all functions before streams. Do not invent existing IDs.";
-        return analyze(system + "\nTask:\n" + prompt, snapshot, apiKey, model);
+        return complete(Lab1Specification.SYSTEM_PROMPT, prompt, snapshot, apiKey, model);
     }
     static String esc(String value) { return value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"); }
     static String content(String json) {

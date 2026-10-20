@@ -4,12 +4,11 @@ import com.ramussoft.gui.common.*;
 import com.ramussoft.gui.common.event.ActionEvent;
 import javax.swing.*;
 import java.awt.*;
-import java.util.ArrayList;
 import com.ramussoft.idef0.NDataPluginFactory;
 import com.ramussoft.idef0.IDEF0ViewPlugin;
 import com.ramussoft.idef0.OpenDiagram;
 
-/** Ramus UI entry point for the separate AI agent. It performs no model writes. */
+/** Native assistant: validated IDEF0 plans are applied only after approval. */
 public final class RamusAiPlugin extends AbstractViewPlugin {
     public static final String VIEW_ID = "RamusAI";
     private static final String OPEN_ACTION = "RamusAI.Open";
@@ -84,7 +83,13 @@ public final class RamusAiPlugin extends AbstractViewPlugin {
             });
             result.setLineWrap(true); result.setWrapStyleWord(true);
             bottom.setBorder(BorderFactory.createTitledBorder("Результат и журнал выполнения"));
-            buttons.add(generate); buttons.add(new JLabel("Изменения — только после подтверждения")); bottom.add(buttons, BorderLayout.NORTH); bottom.add(new JScrollPane(result), BorderLayout.CENTER);
+            JButton example = new JButton("Пример: транспортная компания");
+            example.setToolTipText("Проверенный учебный пример Лаб 1 без запроса к облаку");
+            example.addActionListener(e -> applyPlan(root, TransportCompanyPlan.create()));
+            buttons.setLayout(new BoxLayout(buttons, BoxLayout.Y_AXIS));
+            buttons.add(generate); buttons.add(Box.createVerticalStrut(5)); buttons.add(example);
+            buttons.add(new JLabel("Лаб 1 · подтверждение перед применением"));
+            bottom.add(buttons, BorderLayout.NORTH); bottom.add(new JScrollPane(result), BorderLayout.CENTER);
             JSplitPane workArea = new JSplitPane(JSplitPane.VERTICAL_SPLIT, center, bottom);
             workArea.setResizeWeight(0.55); workArea.setContinuousLayout(true); workArea.setOneTouchExpandable(true);
             JPanel header = new JPanel(new BorderLayout(0, 6));
@@ -115,151 +120,70 @@ public final class RamusAiPlugin extends AbstractViewPlugin {
             new SwingWorker<String,Void>() {
                 protected String doInBackground() throws Exception {
                     ModelSnapshot snapshot = snapshots.capture(framework.getEngine());
-                    if ("deepseek".equals(selectedProfile.type())) return new DeepSeekClient().generatePlan(prompt, snapshot, selectedProfile.apiKey(), selectedProfile.model());
-                    return new LocalLlmClient(selectedProfile.endpoint()).generatePlan(prompt, snapshot, selectedProfile.model());
+                    String task = prompt;
+                    for (int attempt = 0; attempt < 2; attempt++) {
+                        String answer = "deepseek".equals(selectedProfile.type())
+                                ? new DeepSeekClient().generatePlan(task, snapshot, selectedProfile.apiKey(), selectedProfile.model())
+                                : new LocalLlmClient(selectedProfile.endpoint()).generatePlan(task, snapshot, selectedProfile.model());
+                        try {
+                            new Lab1PlanValidator().validate(planParser.parse(answer));
+                            return answer;
+                        } catch (IllegalArgumentException invalid) {
+                            if (attempt == 1) throw invalid;
+                            task = prompt + "\nИсправь предыдущий план. Ошибка проверки: "
+                                    + invalid.getMessage() + "\nПредыдущий JSON:\n" + answer;
+                        }
+                    }
+                    throw new IllegalStateException("План не прошёл проверку");
                 }
                 protected void done() { try {
                     String answer = get();
-                    {
-                        boolean transportTemplate = isTransportCompanyTask(prompt);
-                        AiPlan plan = transportTemplate ? transportCompanyPlan() : planParser.parse(answer);
-                        result.setText((transportTemplate ? "Для транспортной компании используется встроенный шаблон, а не план, возвращённый моделью.\n\n" : "") + describePlan(plan));
-                        int approval = JOptionPane.showConfirmDialog(parent,
-                                "Применить показанный план к открытому проекту?\n"
-                                + "Существующие одноимённые блоки могут быть перемещены, а стрелки заменены.\n"
-                                + "Рекомендуется сначала сохранить копию проекта.",
-                                "Подтверждение изменений", JOptionPane.OK_CANCEL_OPTION,
-                                JOptionPane.WARNING_MESSAGE);
-                        if (approval != JOptionPane.OK_OPTION) {
-                            result.append("\n\nИзменения не применены.");
-                            return;
-                        }
-                        result.setText("План готов. Применяю всю модель одним запуском...");
-                        try {
-                            // Ramus' IDEF0 model and diagram geometry are GUI-backed APIs;
-                            // mutate them on the EDT as one ordered operation.
-                            java.util.List<com.ramussoft.common.Element> created = tools.execute(
-                                    framework.getEngine(), framework.getAccessRules(), plan,
-                                    message -> result.append("\n• " + message));
-                            NDataPluginFactory.fullRefrash(framework);
-                            com.ramussoft.common.Qualifier modelQualifier = framework.getEngine().getQualifierByName("Работы");
-                            if (modelQualifier != null) {
-                                com.ramussoft.pb.DataPlugin modelData = NDataPluginFactory.getDataPlugin(modelQualifier, framework.getEngine(), framework.getAccessRules());
-                                com.ramussoft.pb.Function base = (com.ramussoft.pb.Function) modelData.getBaseFunction();
-                                long contextId = -1L;
-                                int bestChildCount = -1;
-                                int selectedChildCount = -1;
-                                for (int i = 0; i < base.getChildCount(); i++) {
-                                    com.ramussoft.pb.Row row = (com.ramussoft.pb.Row) base.getChildAt(i);
-                                    if (row instanceof com.ramussoft.pb.Function) {
-                                        if (normalizeModelName("Оказать услуги по перевозке грузов")
-                                                .equals(normalizeModelName(row.getName()))) {
-                                            contextId = row.getElement().getId();
-                                            selectedChildCount = row.getChildCount();
-                                            break;
-                                        }
-                                        if (row.getChildCount() > bestChildCount) {
-                                            bestChildCount = row.getChildCount();
-                                            contextId = row.getElement().getId();
-                                            selectedChildCount = bestChildCount;
-                                        }
-                                    }
-                                }
-                                long expectedStages = plan.operations().stream()
-                                        .filter(op -> "create_element".equals(op.tool())
-                                                && op.qualifier().startsWith("Работы::")
-                                                && !op.qualifier().substring("Работы::".length()).contains("::"))
-                                        .count();
-                                if (contextId < 0 || selectedChildCount < expectedStages)
-                                    throw new IllegalStateException("Не нашёл контекстную диаграмму с этапами. Перестроение остановлено, чтобы не открывать пустой уровень A-0.");
-                                framework.propertyChanged(IDEF0ViewPlugin.OPEN_DIAGRAM,
-                                        new OpenDiagram(modelQualifier, contextId, true));
-                            }
-                            long contextCount = plan.operations().stream().filter(op -> "create_element".equals(op.tool()) && "Работы".equals(op.qualifier())).count();
-                            long stageCount = plan.operations().stream().filter(op -> "create_element".equals(op.tool()) && op.qualifier().startsWith("Работы::") && !op.qualifier().substring("Работы::".length()).contains("::")).count();
-                            long detailCount = plan.operations().stream().filter(op -> "create_element".equals(op.tool()) && op.qualifier().startsWith("Работы::") && op.qualifier().substring("Работы::".length()).contains("::")).count();
-                            long functionCount = contextCount + stageCount + detailCount;
-                            long streamCount = plan.operations().stream().filter(op -> "create_stream".equals(op.tool())).count();
-                            result.append("\n\nГотово. Функций: " + functionCount + " (контекст: " + contextCount + ", блоков на единой A0: " + stageCount + ", вложенных блоков: " + detailCount + "), стрелок: " + streamCount + ". Диаграмма открыта с масштабом «вписать целиком».");
-                        } catch (Exception e) {
-                            result.append("\nОшибка выполнения: " + e.getMessage());
-                        }
-                    }
+                    AiPlan plan = planParser.parse(answer);
+                    applyPlan(parent, plan);
                 } catch (Exception e) { Throwable cause = e.getCause() == null ? e : e.getCause(); result.setText("Не удалось сформировать план: " + cause.getMessage()); }
                 finally { generate.setEnabled(true); } }
             }.execute();
         }
-        private static boolean isTransportCompanyTask(String prompt) {
-            String text = prompt == null ? "" : prompt.toLowerCase(java.util.Locale.ROOT);
-            return text.contains("транспорт") && (text.contains("компан") || text.contains("груз"));
-        }
-        private static String normalizeModelName(String value) {
-            return value == null ? "" : value.toLowerCase(java.util.Locale.ROOT)
-                    .replaceAll("[^\\p{L}\\p{Nd}]+", " ").trim().replaceAll("\\s+", " ");
-        }
-        private static AiPlan transportCompanyPlan() {
-            java.util.List<AiPlan.AiOperation> operations = new ArrayList<>();
-            String context = "Оказать услуги по перевозке грузов";
-            String contract = "Оформить договор и согласовать тарифы";
-            String prepare = "Организовать подготовку и перевозку груза";
-            String deliver = "Доставить груз и подтвердить исполнение договора";
-            addFunction(operations, "Работы", context);
-            addBoundaryIn(operations, "Потоки", "Заявка клиента и характеристики груза", "@LEFT", context);
-            addBoundaryIn(operations, "Потоки", "Груз клиента для передачи на перевозку", "@LEFT", context);
-            addBoundaryIn(operations, "Потоки", "Правила перевозки, тарифы, сроки и требования к сохранности", "@TOP", context);
-            addBoundaryIn(operations, "Потоки", "Персонал, транспортный парк, склад и средства погрузки", "@BOTTOM", context);
-            addBoundaryOut(operations, "Потоки", "Доставленный груз и подтверждение исполнения договора", context, "@RIGHT");
-
-            String a0Streams = "Потоки::" + context;
-            String receive = "Принять груз и сверить условия договора";
-            String prepareCargo = "Подготовить груз и организовать хранение";
-            String maintenance = "Обеспечить исправность транспортных средств";
-            String logistics = "Спланировать логистику и маршрут";
-            String storage = "Хранить груз до согласованной отправки";
-            String load = "Погрузить груз и оформить отправку";
-            String deliverCargo = "Доставить и разгрузить груз в срок";
-            String tracking = "Контролировать перевозку, охрану и сопровождение";
-            // All operational blocks are siblings on one compact A0 canvas.
-            // Keep the conventional one-block context diagram A-0 separately.
-            addFunctions(operations, context, contract, receive, prepareCargo, maintenance,
-                    logistics, storage, load, deliverCargo, tracking);
-            addStream(operations, a0Streams, "Договор, тарифы и требования к перевозке", contract, receive, "control");
-            addStream(operations, a0Streams, "Принятый груз и параметры перевозки", receive, prepareCargo);
-            addStream(operations, a0Streams, "Подготовленный груз для хранения", prepareCargo, storage);
-            addStream(operations, a0Streams, "Груз, готовый к погрузке", storage, load);
-            addStream(operations, a0Streams, "Маршрут и график подачи транспорта", logistics, load, "control");
-            addStream(operations, a0Streams, "Исправный транспорт и водитель", maintenance, logistics, "mechanism");
-            addStream(operations, a0Streams, "Погруженный груз и отправочные документы", load, deliverCargo);
-            addStream(operations, a0Streams, "Адрес, срок и условия доставки", contract, deliverCargo, "control");
-            addStream(operations, a0Streams, "Фактическое местоположение и статус груза", deliverCargo, tracking);
-            addStream(operations, a0Streams, "Отклонения маршрута и корректировки логистики", tracking, logistics, "control");
-            addStream(operations, a0Streams, "Заказ охраны или экспедиторского сопровождения", contract, tracking, "control");
-            addStream(operations, a0Streams, "Охрана и сопровождение при доставке", tracking, deliverCargo, "mechanism");
-            addBoundaryIn(operations, a0Streams, "Заявка клиента и договорные сведения", "@LEFT", contract);
-            addBoundaryIn(operations, a0Streams, "Груз, переданный клиентом", "@LEFT", receive);
-            addBoundaryIn(operations, a0Streams, "Правила перевозки и требования к сохранности", "@TOP", logistics);
-            addBoundaryIn(operations, a0Streams, "Транспортный парк и персонал", "@BOTTOM", maintenance);
-            addBoundaryIn(operations, a0Streams, "Склад и средства погрузки", "@BOTTOM", load);
-            addBoundaryOut(operations, a0Streams, "Доставленный груз и подтверждение исполнения", deliverCargo, "@RIGHT");
-            return new AiPlan("IDEF0: все операционные блоки и связи на одном листе A0; A-0 содержит только контекст", operations);
-        }
-        private static void addFunction(java.util.List<AiPlan.AiOperation> operations, String qualifier, String name) {
-            operations.add(new AiPlan.AiOperation("create_element", qualifier, name, "", "", "", "", ""));
-        }
-        private static void addFunctions(java.util.List<AiPlan.AiOperation> operations, String diagramPath, String... names) {
-            for (String name : names) addFunction(operations, "Работы::" + diagramPath, name);
-        }
-        private static void addStream(java.util.List<AiPlan.AiOperation> operations, String qualifier, String name, String source, String target) {
-            addStream(operations, qualifier, name, source, target, "input");
-        }
-        private static void addStream(java.util.List<AiPlan.AiOperation> operations, String qualifier, String name, String source, String target, String icom) {
-            operations.add(new AiPlan.AiOperation("create_stream", qualifier, name, source, target, icom, "", ""));
-        }
-        private static void addBoundaryIn(java.util.List<AiPlan.AiOperation> operations, String qualifier, String name, String border, String target) {
-            operations.add(new AiPlan.AiOperation("create_stream", qualifier, name, border, target, border.substring(1).toLowerCase(java.util.Locale.ROOT), "", ""));
-        }
-        private static void addBoundaryOut(java.util.List<AiPlan.AiOperation> operations, String qualifier, String name, String source, String border) {
-            operations.add(new AiPlan.AiOperation("create_stream", qualifier, name, source, border, border.substring(1).toLowerCase(java.util.Locale.ROOT), "", ""));
+        private void applyPlan(Component parent, AiPlan plan) {
+            new Lab1PlanValidator().validate(plan);
+            result.setText(describePlan(plan));
+            int approval = JOptionPane.showConfirmDialog(parent,
+                    "План проверен: A-0, A0, второй уровень, стороны ICOM и баланс границ.\n"
+                    + "Применить его к открытому проекту? Сохраните копию перед изменением.",
+                    "Генерация IDEF0 по Лаб 1", JOptionPane.OK_CANCEL_OPTION);
+            if (approval != JOptionPane.OK_OPTION) {
+                result.append("\nИзменения не применены.");
+                return;
+            }
+            try {
+                java.util.List<com.ramussoft.common.Element> created = tools.execute(
+                        framework.getEngine(), framework.getAccessRules(), plan,
+                        message -> result.append("\n• " + message));
+                NDataPluginFactory.fullRefrash(framework);
+                com.ramussoft.common.Qualifier qualifier = RamusToolExecutor.functionQualifier(framework.getEngine());
+                com.ramussoft.pb.DataPlugin data = NDataPluginFactory.getDataPlugin(
+                        qualifier, framework.getEngine(), framework.getAccessRules());
+                String contextName = plan.operations().stream()
+                        .filter(op -> "create_element".equals(op.tool()) && "Работы".equals(op.qualifier()))
+                        .findFirst().orElseThrow().name();
+                com.ramussoft.pb.Function base = (com.ramussoft.pb.Function) data.getBaseFunction();
+                com.ramussoft.pb.Function context = null;
+                for (int i = 0; i < base.getChildCount(); i++) {
+                    com.ramussoft.pb.Function child = (com.ramussoft.pb.Function) base.getChildAt(i);
+                    if (contextName.equals(child.getName())) context = child;
+                }
+                if (context == null) throw new IllegalStateException("Контекст не сохранился");
+                framework.propertyChanged(IDEF0ViewPlugin.OPEN_DIAGRAM,
+                        new OpenDiagram(qualifier, context.getElement().getId(), true));
+                long functions = plan.operations().stream().filter(op -> "create_element".equals(op.tool())).count();
+                long arrows = plan.operations().size() - functions;
+                result.append("\n\nГотово: функций " + functions + ", связей " + arrows
+                        + ". Новых объектов: " + created.size() + ". Открыта A0.\n"
+                        + "Вверх — контекст A-0. Дважды нажмите на этап для декомпозиции A1/A2/A3.\n"
+                        + "Сохраните проект через Файл → Сохранить как.");
+            } catch (Exception e) {
+                result.append("\nОшибка применения: " + e.getMessage());
+            }
         }
         private static String describePlan(AiPlan plan) {
             StringBuilder text = new StringBuilder(plan.summary()).append('\n');

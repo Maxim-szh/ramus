@@ -36,7 +36,9 @@ public final class AiPlanParser {
                     if (qualifier.isBlank() || name.isBlank()) throw new IllegalArgumentException("У операции отсутствует название или классификатор");
                     operations.add(new AiPlan.AiOperation(tool, qualifier, name, fields.getOrDefault("source", ""),
                             fields.getOrDefault("target", ""), fields.getOrDefault("icom", ""),
-                            fields.getOrDefault("style", ""), fields.getOrDefault("color", "")));
+                            fields.getOrDefault("style", ""), fields.getOrDefault("color", ""),
+                            fields.getOrDefault("description", ""), fields.getOrDefault("tunnel", ""),
+                            fields.getOrDefault("parentStream", "")));
                     if (operations.size() > 200) throw new IllegalArgumentException("В плане слишком много операций");
                 }
             } else if (c == ']' && depth == 0) { closed = true; break; }

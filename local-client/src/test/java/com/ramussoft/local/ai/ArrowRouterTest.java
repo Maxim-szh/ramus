@@ -7,6 +7,11 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class ArrowRouterTest {
+    @Test public void givesParallelArrowsSeparateLanes() {
+        var route = ArrowRouter.route(new Point2D.Double(20, 70), new Point2D.Double(200, 70), List.of(),
+                List.of(new FRectangle(20, 70, 180, 0.1)));
+        assertTrue("Congested horizontal path must detour", route.stream().anyMatch(p -> p.y != 70));
+    }
     @Test public void avoidsBlockBetweenAlignedEndpoints() {
         List<FRectangle> blocks = List.of(new FRectangle(80, 30, 60, 80));
         List<Point2D.Double> route = ArrowRouter.route(new Point2D.Double(20, 70),

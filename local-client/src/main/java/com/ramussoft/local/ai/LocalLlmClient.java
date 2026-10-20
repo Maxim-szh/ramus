@@ -25,7 +25,7 @@ final class LocalLlmClient {
 
     String generatePlan(String prompt, ModelSnapshot snapshot, String model) throws Exception {
         if (model == null || model.isBlank()) throw new IllegalArgumentException("Укажите название установленной локальной модели");
-        String system = "Ответь только JSON: {\"operations\":[{\"tool\":\"create_element\",\"qualifier\":\"Работы\",\"name\":\"...\"},{\"tool\":\"create_stream\",\"qualifier\":\"Потоки\",\"name\":\"...\",\"source\":\"...\",\"target\":\"...\",\"icom\":\"input|control|mechanism\"}]}. Для вложенных работ qualifier: Работы::имя родителя, для связей: Потоки::имя родителя. Источник и получатель должны точно совпадать с названиями работ. Только create_element и create_stream.";
+        String system = Lab1Specification.SYSTEM_PROMPT;
         String body = "{\"model\":\"" + DeepSeekClient.esc(model) + "\",\"stream\":false,\"messages\":[{\"role\":\"system\",\"content\":\""
                 + DeepSeekClient.esc(system) + "\"},{\"role\":\"user\",\"content\":\""
                 + DeepSeekClient.esc(prompt + "\n\nСостояние проекта:\n" + snapshot.content()) + "\"}]}";
